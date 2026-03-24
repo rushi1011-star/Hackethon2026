@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Municipal Live-Track System 2026</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        :root {
+            --primary: #2c3e50; --accent: #3498db; --success: #27ae60;
+            --danger: #e74c3c; --bg: #f4f7f6;
+        }
+        body, html { height: 100%; margin: 0; font-family: 'Segoe UI', sans-serif; background: var(--bg); overflow: hidden; }
+        .dashboard { display: flex; height: 100vh; width: 100vw; }
+        
+        /* नकाशा पूर्ण दिसण्यासाठी उंची सेट केली आहे */
+        #map-container { flex: 1; position: relative; border-right: 2px solid #ddd; height: 100vh; }
+        #map { height: 100%; width: 100%; z-index: 1; }
+        
+        .controls-panel { width: 450px; background: white; padding: 20px; overflow-y: auto; box-shadow: -5px 0 15px rgba(0,0,0,0.1); z-index: 10; }
+        .card { background: #fff; border: 1px solid #eee; padding: 15px; margin-bottom: 15px; border-radius: 10px; border-left: 5px solid var(--accent); }
+        .admin-section { border-left-color: var(--primary); background: #f9f9f9; }
+        h3 { margin-top: 0; color: var(--primary); font-size: 1.1em; }
+        label { display: block; margin: 10px 0 5px; font-weight: 600; font-size: 0.8em; color: #666; }
+        input, select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; margin-top: 10px; color: white; transition: 0.3s; }
+        .btn-admin { background: var(--primary); }
+        .btn-success { background: var(--success); }
+        .btn-stop { background: var(--danger); }
+        .status-pill { padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: bold; text-transform: uppercase; }
+        .online { background: #d4edda; color: #155724; }
+        .offline { background: #f8d7da; color: #721c24; }
+        .worker-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
+    </style>
+</head>
+<body>
+
+<div class="dashboard">
+    <div id="map-container"><div id="map"></div></div>
+
+    <div class="controls-panel">
+        <div class="card admin-section">
+            <h3>👷 Admin: Register Worker</h3>
+            <label>Full Name</label>
+            <input type="text" id="admName" placeholder="Worker Name">
+            <div style="display:flex; gap:10px">
+                <div style="flex:1"><label>Shift Start</label><input type="time" id="admStart" value="09:00"></div>
+                <div style="flex:1"><label>Shift End</label><input type="time" id="admEnd" value="18:00"></div>
+            </div>
+            <button class="btn btn-admin" onclick="addWorker()">Register & Save</button>
+        </div>
+
+        <div class="card">
+            <h3>📡 Live Workforce</h3>
+            <div id="workerList"></div>
+        </div>
+
+        <div id="livePanel" class="card" style="display:none; border-left-color: var(--success); background: #f0fff4;">
+            <h3 id="activeName">Portal: Worker Name</h3>
+            <p id="activeShift" style="font-size:0.8em; margin:0"></p>
+            
+            <label>सध्याचे काम निवडा (Select Task)</label>
+            <select id="taskSelect" style="margin-bottom: 10px;">
+                <option value="On Duty">On Duty (सामान्य duty)</option>
+                <option value="Garbage Collection">Garbage Collection (कचरा संकलन)</option>
+                <option value="Road Repair">Road Repair (रस्ता दुरुस्ती)</option>
+                <option value="Cleaning">Cleaning (स्वच्छता)</option>
+                <option value="On Break">On Break (सुट्टी/ब्रेक)</option>
+            </select>
+
+            <div id="gpsData" style="font-family: monospace; font-size: 0.85em; margin: 10px 0; color: #27ae60;">
+                Awaiting Signal...
+            </div>
+            <button id="trackBtn" class="btn btn-success" onclick="toggleTracking()">Start Live Work Session</button>
+        </div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    let workers = JSON.parse(localStorage.getItem('muni_db')) || [];
+    let watchID = null;
+    let selectedWorkerId = null;
+    let mapMarkers = {};
+
+    // Map Initialization
+    const map = L.map('map').setView([18.5204, 73.8567], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    function addWorker() {
+        const name = document.getElementById('admName').value;
+        const start = document.getElementById('admStart').value;
+        const end = document.getElementById('admEnd').value;
+        
+        if(!name) return alert("Please enter a name");
+        
+        const newWorker = {
+            id: "W" + Date.now(),
+            name: name,
+            shift: `${start} - ${end}`,
+            lat: 18.5204, 
+            lng: 73.8567, 
+            status: 'offline',
+            lastUpdate: 'Never'
+        };
+
+        workers.push(newWorker);
+        sync();
+        document.getElementById('admName').value = '';
+    }
+
+    function sync() {
+        localStorage.setItem('muni_db', JSON.stringify(workers));
+        renderList();
+        updateMarkers();
+    }
+
+    function renderList() {
+        const container = document.getElementById('workerList');
+        container.innerHTML = workers.map(w => `
+            <div class="worker-item">
+                <div>
+                    <strong>${w.name}</strong><br>
+                    <span class="status-pill ${w.status}">${w.status}</span>
+                </div>
+                <button onclick="openPortal('${w.id}')" style="padding: 5px 10px; cursor:pointer;">Portal</button>
+            </div>
+        `).join('');
+    }
+
+    function updateMarkers() {
+        workers.forEach(w => {
+            if (mapMarkers[w.id]) {
+                map.removeLayer(mapMarkers[w.id]);
+            }
+            
+            const color = w.status === 'online' ? '#27ae60' : '#7f8c8d';
+            mapMarkers[w.id] = L.circleMarker([w.lat, w.lng], {
+                radius: 10,
+                color: color,
+                fillColor: color,
+                fillOpacity: 0.8
+            }).addTo(map).bindPopup(`<b>${w.name}</b><br>Status: ${w.status}<br>Updated: ${w.lastUpdate}`);
+        });
+    }
+
+    function openPortal(id) {
+        selectedWorkerId = id;
+        const worker = workers.find(w => w.id === id);
+        
+        document.getElementById('livePanel').style.display = 'block';
+        document.getElementById('activeName').innerText = "Portal: " + worker.name;
+        document.getElementById('activeShift').innerText = "Shift: " + worker.shift;
+        
+        const btn = document.getElementById('trackBtn');
+        if (watchID && selectedWorkerId === worker.id) {
+            btn.innerText = "Stop Work & Clock Out";
+            btn.className = "btn btn-stop";
+        } else {
+            btn.innerText = "Start Live Work Session";
+            btn.className = "btn btn-success";
+        }
+    }
+
+    function toggleTracking() {
+        if (watchID === null) {
+            startTracking();
+        } else {
+            stopTracking();
+        }
+    }
+
+    function startTracking() {
+        if (!navigator.geolocation) return alert("GPS supported नाही!");
+        if (!selectedWorkerId) return alert("कृपया आधी कामगार निवडा!");
+
+        const workerIndex = workers.findIndex(w => w.id === selectedWorkerId);
+        if (workerIndex === -1) return;
+
+        workers[workerIndex].status = 'online';
+        
+        const btn = document.getElementById('trackBtn');
+        btn.innerText = "Stop Work & Clock Out";
+        btn.className = "btn btn-stop";
+
+        watchID = navigator.geolocation.watchPosition(
+            async (pos) => {
+                const { latitude, longitude } = pos.coords;
+                
+                workers[workerIndex].lat = latitude;
+                workers[workerIndex].lng = longitude;
+                workers[workerIndex].lastUpdate = new Date().toLocaleTimeString();
+
+                document.getElementById('gpsData').innerHTML = `📍 LIVE: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+                map.setView([latitude, longitude], 16);
+                
+                sync(); 
+
+                // Get the current selected task value
+                const selectedTask = document.getElementById('taskSelect').value;
+
+                // FastAPI कडे डेटा पाठवणे
+                try {
+                    await fetch(`http://127.0.0.1:8000/update-location`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            worker_id: selectedWorkerId,
+                            latitude: latitude,
+                            longitude: longitude,
+                            task: selectedTask // Changed from "Selected task" to dynamic value
+                        })
+                    });
+                } catch (error) {
+                    console.error("FastAPI Connection Error:", error);
+                }
+            },
+            (err) => {
+                console.error(err);
+                alert("Location access denied.");
+                stopTracking();
+            },
+            { enableHighAccuracy: true }
+        );
+    }
+
+    function stopTracking() {
+        if (watchID !== null) {
+            navigator.geolocation.clearWatch(watchID);
+            watchID = null;
+            
+            const workerIndex = workers.findIndex(w => w.id === selectedWorkerId);
+            if (workerIndex !== -1) {
+                workers[workerIndex].status = 'offline';
+            }
+            
+            const btn = document.getElementById('trackBtn');
+            btn.innerText = "Start Live Work Session";
+            btn.className = "btn btn-success";
+            
+            document.getElementById('gpsData').innerText = "Session Ended.";
+            sync();
+        }
+    }
+
+    // Initial load
+    renderList();
+    updateMarkers();
+</script>
+</body>
+</html>
